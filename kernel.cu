@@ -11,6 +11,7 @@ namespace cg = cooperative_groups;
 #include <cstdint>
 #include <cmath>
 #include <ctime>
+#include <assert.h>
 
 // Utility class used to avoid linker errors with extern
 // unsized shared memory arrays with templated type
@@ -61,20 +62,18 @@ __device__ __forceinline__ int warpReduceSum<int>(unsigned int mask,
 }
 #endif
 
-cudaError_t CudaReduce(int *c, const int *a, unsigned int size);
+cudaError_t CudaReduce(unsigned int *c, const unsigned int *a, unsigned int size, const unsigned int arg_dSliceSize);
 cudaError_t CudaVectorSum(int* c, const int* a, unsigned int size);
 
 //template<class Type>
 //cudaError_t CudaAccumulate(Type* c, const Type* a, unsigned int size);
 
-cudaError_t CudaAccumulate(uint32_t* arg_pAccumulate, const uint32_t* arg_pVector, unsigned int arg_dSize);
-cudaError_t CudaSparseToDense(uint32_t* arg_pArrayToModify, uint32_t arg_dSize);
+cudaError_t CudaAccumulate(uint32_t* arg_pAccumulate, const uint32_t* arg_pVector, unsigned int arg_dSize, const unsigned int arg_dSliceSize);
+cudaError_t CudaSparseToPackedCell(uint32_t* arg_pArrayToModify, uint32_t arg_dSize, const uint32_t arg_dSliceSize);
+cudaError_t CudaMergeCells(uint32_t* arg_pArrayToModify, uint32_t* arg_pCellLengthArray, uint32_t arg_dSize, const uint32_t arg_dCellSize, const uint32_t arg_dCellCount);
 
+cudaError_t CudaAccumulateAndPack(uint32_t* arg_pArray, const uint32_t arg_dSize);
 
-__global__ void KernelAccumulateArray(int *c, int *a)
-{
-
-}
 
 template <class T>
 __global__ void reduce0(T* g_idata, T* g_odata, unsigned int n) {
@@ -273,7 +272,7 @@ __global__ void vector_sum(T* g_idata, T* g_odata, unsigned int n) {
 }
 
 template <class Type>
-__global__ void masked_array_to_list(Type* arg_array, Type arg_data_zero, uint32_t arg_array_size, uint32_t arg_bin_start_width = 0)
+__global__ void masked_array_to_list_first(Type* arg_array, Type arg_data_zero, uint32_t arg_array_size)
 {
     Type* pCommonMem = SharedMemory<Type>();
 
@@ -318,107 +317,148 @@ __global__ void masked_array_to_list(Type* arg_array, Type arg_data_zero, uint32
     }
 }
 
+/* arg_length_array_size == blockDom.x // the number of length elements passed should be equal to the number of threads */
+template <class Type>
+__global__ void masked_array_to_list_second(Type* arg_array, Type* arg_length_array, uint32_t arg_array_size, uint32_t arg_length_array_size, uint32_t arg_cell_size)
+{
+    uint32_t kernelThreadId = blockIdx.x * blockDim.x + threadIdx.x;
+    uint32_t kernelStride = blockDim.x * gridDim.x;
+
+    uint32_t threadId = threadIdx.x;
+    uint32_t threadCount = blockDim.x;
+
+    for (uint32_t loop_stride = 2, loop_cell_size = arg_cell_size; loop_stride <= arg_length_array_size; loop_stride <<= 1, loop_cell_size <<= 1) {
+        if (threadId % loop_stride == 0) {
+            uint32_t left_length = arg_length_array[threadId], right_length = arg_length_array[threadId + loop_stride - (loop_stride >> 1)];
+            uint32_t left_start = loop_cell_size * threadId, right_start = loop_cell_size * threadId + loop_cell_size;
+            uint32_t transfered_elems = 0;
+
+            while (transfered_elems < right_length) {
+                Type temp = arg_array[left_start + left_length + transfered_elems];
+                arg_array[left_start + left_length + transfered_elems] = arg_array[right_start + transfered_elems];
+                arg_array[right_start + transfered_elems] = temp;
+
+                transfered_elems++;
+            }
+
+            arg_length_array[threadId] += arg_length_array[threadId + loop_stride - (loop_stride >> 1)];
+        }
+
+        __syncthreads();
+    }
+}
+
+template <class Type>
+__global__ void collect_reduce_first_elem(Type* arg_result, Type* arg_array, uint32_t arg_bin_size, uint32_t arg_bin_count, uint32_t arg_array_size)
+{
+    uint32_t kernelThreadId = blockIdx.x * blockDim.x + threadIdx.x;
+    uint32_t kernelStride = blockDim.x * gridDim.x;
+
+    uint32_t threadId = threadIdx.x;
+    uint32_t threadCount = blockDim.x;
+
+    for (uint32_t idx_bin = 0; idx_bin < arg_bin_count; idx_bin += kernelStride) {
+        arg_result[idx_bin + kernelThreadId] = arg_array[idx_bin + kernelThreadId * arg_bin_size]; 
+    }
+}
+
 typedef void (*SimpleFunc)(int* c, int* a);
 
 int main()
 {
-    const unsigned int array_size = 2000;
-    const unsigned int count = 200;
+    const unsigned int array_size = 4096;
+    const unsigned int slice_size = 64;
+    const unsigned int count = 600;
 
-    const unsigned int sparse_array_size = 128;
-    const unsigned int sparse_data_count = 48;
-
-    unsigned int sparse_a[array_size] = {};
-
-    unsigned int natural_a[array_size] = {};
+    unsigned int sparse_array[array_size] = {};
     
     unsigned int sum_array[array_size] = {};
 
     unsigned int acc_array[array_size] = {};
 
-    unsigned int sparse_array[sparse_array_size] = {};
+    unsigned int sum = 0;
 
     srand(time(0));
-
-    int gridSize, blockSize;
-
-    cudaOccupancyMaxPotentialBlockSize(&gridSize, &blockSize, &vector_sum<uint32_t>, 0, 0);
 
     //Populate the sparse
      for (uint32_t sparse_elem_count = 0; sparse_elem_count < count; sparse_elem_count++) {
         uint32_t idx_sparse_elem = rand() % array_size;
 
-        while (sparse_a[idx_sparse_elem] == 1) {
-            idx_sparse_elem++;
-            idx_sparse_elem %= array_size;
-        }
-
-        sparse_a[idx_sparse_elem] = 1;
-    }
-
-    //Populate the sparse
-    for (uint32_t sparse_elem_count = 0; sparse_elem_count < sparse_data_count; sparse_elem_count++) {
-        uint32_t idx_sparse_elem = rand() % sparse_array_size;
-
         while (sparse_array[idx_sparse_elem] == 1) {
             idx_sparse_elem++;
-            idx_sparse_elem %= sparse_array_size;
+            idx_sparse_elem %= array_size;
         }
 
         sparse_array[idx_sparse_elem] = 1;
     }
 
-    //Populate Natural numbers
-    for (uint32_t idx_nat = 0; idx_nat < 1024; idx_nat++) {
-        natural_a[idx_nat] = idx_nat + 1;
-    }
-
     //Check
     uint32_t sum_check = 0;
     for (uint32_t idx = 0; idx < array_size; idx++) {
-        if (sparse_a[idx] == 1) sum_check++;
+        if (sparse_array[idx] == 1) sum_check++;
     }
 
-    printf("Check: %d\n", sum_check);
+    printf("Total Sum: %d\n", sum_check);
+
+    //Slice Sum
+    for (uint32_t slice_idx = 0; slice_idx < array_size; slice_idx += slice_size) {
+        uint32_t slice_sum = 0;
+
+        for (uint32_t inner_idx = 0; inner_idx < slice_size; inner_idx++) {
+            slice_sum += sparse_array[slice_idx + inner_idx];
+        }
+
+        sum_array[slice_idx / slice_size] = slice_sum;
+    }
+
+    //Print Slice Sums
+    printf("Slice Sums:\n");
+    for (auto idx_sums = 0; idx_sums < slice_size; idx_sums++) {
+        printf("%d, ", sum_array[idx_sums]);
+    }
+    printf("\n\n");
 
     // Add vectors in parallel.
-    cudaError_t cudaStatus = CudaAccumulate(sum_array, sparse_a, array_size);
+    cudaError_t cudaStatus = CudaReduce(sum_array, sparse_array, array_size, 64);
     if (cudaStatus != cudaSuccess) {
         fprintf(stderr, "CudaReduce failed!");
         return 1;
     }
 
+    //Print Slice Sums
+    printf("Cuda Slice Sums:\n");
+    for (auto idx_sums = 0; idx_sums < slice_size; idx_sums++) {
+        printf("%d, ", sum_array[idx_sums]);
+    }
+    printf("\n\n");
+
     // Add vectors in parallel.
-    //cudaStatus = CudaVectorSum(acc_array, natural_a, 1024);
-    //if (cudaStatus != cudaSuccess) {
-    //    fprintf(stderr, "CudaReduce failed!");
-    //    return 1;
-    //}
-
-    printf("{%d,%d,%d,%d,%d}\n",
-        sum_array[0], sum_array[1], sum_array[2], sum_array[3], sum_array[4]);
-
-    cudaStatus = CudaSparseToDense(sparse_array, sparse_array_size);
+    cudaStatus = CudaAccumulate(&sum, sparse_array, array_size, 64);
     if (cudaStatus != cudaSuccess) {
-        fprintf(stderr, "CudaSparseToDense failed!");
+        fprintf(stderr, "CudaAccumulate failed!");
         return 1;
     }
 
-    printf("{%d,%d,%d,%d,%d}\n",
-        sparse_array[0], sparse_array[1], sparse_array[2], sparse_array[3], sparse_array[4]);
+    printf("Cuda Total Sum: %d\n\n", sum);
 
-    // Add vectors in parallel.
-    //cudaStatus = CudaVectorSum(acc_array, natural_a, 1024);
-    //if (cudaStatus != cudaSuccess) {
-    //    fprintf(stderr, "CudaReduce failed!");
-    //    return 1;
-    //}
+    cudaStatus = CudaSparseToPackedCell(sparse_array, array_size, 64);
+    if (cudaStatus != cudaSuccess) {
+        fprintf(stderr, "CudaSparseToPackedCell failed!");
+        return 1;
+    }
 
-    printf("{%d,%d,%d,%d,%d}\n",
-        acc_array[0], acc_array[1], acc_array[2], acc_array[3], acc_array[4]);
+    printf("Cuda Packed Elems:\n");
+    for (uint32_t slice_idx = 0; slice_idx < array_size; slice_idx += slice_size) {
+        uint32_t slice_sum = 0;
+        uint32_t slice_packed_len = sum_array[slice_idx / slice_size];
 
-    printf("{%d,%d,%d,%d,%d}\n",
-        acc_array[30], acc_array[31], acc_array[32], acc_array[33], acc_array[34]);
+        for (uint32_t inner_idx = 0; inner_idx < slice_packed_len; inner_idx++) {
+            slice_sum += sparse_array[slice_idx + inner_idx];
+        }
+
+        printf("%d, ", slice_sum);
+    }
+    printf("\n\n");
 
     // cudaDeviceReset must be called before exiting in order for profiling and
     // tracing tools such as Nsight and Visual Profiler to show complete traces.
@@ -432,48 +472,52 @@ int main()
 }
 
 // Helper function for using CUDA to add vectors in parallel.
-cudaError_t CudaReduce(int* c, const int* a, unsigned int size)
+cudaError_t CudaReduce(unsigned int* arg_pResult, const unsigned int* arg_pVector, unsigned int arg_dSize, const unsigned int arg_dSliceSize)
 {
-    int *dev_a = 0;
-    int *dev_c = 0;
+    assert(arg_dSliceSize <= 1024);
+
+    unsigned int *dev_pVector = 0;
+    unsigned int *dev_pResult = 0;
     cudaError_t cudaStatus;
+
+    uint32_t dSliceCount = (arg_dSize + arg_dSliceSize - 1) / arg_dSliceSize;
 
     // Choose which GPU to run on, change this on a multi-GPU system.
     cudaStatus = cudaSetDevice(0);
     if (cudaStatus != cudaSuccess) {
-        fprintf(stderr, "cudaSetDevice failed!  Do you have a CUDA-capable GPU installed?");
+        fprintf(stderr, "cudaSetDevice failed!  Do you have arg_pVector CUDA-capable GPU installed?");
         goto Error;
     }
 
     // Allocate GPU buffers for three vectors (two input, one output)    .
-    cudaStatus = cudaMalloc((void**)&dev_c, size * sizeof(int));
+    cudaStatus = cudaMalloc((void**)&dev_pResult, dSliceCount * arg_dSliceSize * sizeof(int));
     if (cudaStatus != cudaSuccess) {
         fprintf(stderr, "cudaMalloc failed!");
         goto Error;
     }
 
-    cudaStatus = cudaMalloc((void**)&dev_a, size * sizeof(int));
+    cudaStatus = cudaMalloc((void**)&dev_pVector, dSliceCount * arg_dSliceSize * sizeof(int));
     if (cudaStatus != cudaSuccess) {
         fprintf(stderr, "cudaMalloc failed!");
         goto Error;
     }
 
     // Copy input vectors from host memory to GPU buffers.
-    cudaStatus = cudaMemcpy(dev_a, a, size * sizeof(int), cudaMemcpyHostToDevice);
+    cudaStatus = cudaMemcpy(dev_pVector, arg_pVector, arg_dSize * sizeof(int), cudaMemcpyHostToDevice);
     if (cudaStatus != cudaSuccess) {
         fprintf(stderr, "cudaMemcpy failed!");
         goto Error;
     }
 
-    cudaStatus = cudaMemcpy(dev_c, c, size * sizeof(int), cudaMemcpyHostToDevice);
+    cudaStatus = cudaMemset(dev_pResult, 0, arg_dSize * sizeof(int));
     if (cudaStatus != cudaSuccess) {
         fprintf(stderr, "cudaMemcpy failed!");
         goto Error;
     }
 
     // Launch a kernel on the GPU with one thread for each element.
-    uint32_t smemSize = 1024 * sizeof(int);
-    reduce0<int> <<<1, 1024, smemSize>>> (dev_a, dev_c, size);
+    uint32_t smemSize = arg_dSliceSize * sizeof(int);
+    reduce0<uint32_t> <<<dSliceCount, arg_dSliceSize, smemSize>>> (dev_pVector, dev_pResult, arg_dSize);
 
     // Check for any errors launching the kernel
     cudaStatus = cudaGetLastError();
@@ -491,15 +535,15 @@ cudaError_t CudaReduce(int* c, const int* a, unsigned int size)
     }
 
     // Copy output vector from GPU buffer to host memory.
-    cudaStatus = cudaMemcpy(c, dev_c, size * sizeof(int), cudaMemcpyDeviceToHost);
+    cudaStatus = cudaMemcpy(arg_pResult, dev_pResult, arg_dSize * sizeof(int), cudaMemcpyDeviceToHost);
     if (cudaStatus != cudaSuccess) {
         fprintf(stderr, "cudaMemcpy failed!");
         goto Error;
     }
 
 Error:
-    cudaFree(dev_c);
-    cudaFree(dev_a);
+    cudaFree(dev_pResult);
+    cudaFree(dev_pVector);
     
     return cudaStatus;
 }
@@ -513,7 +557,7 @@ cudaError_t CudaVectorSum(int* c, const int* a, unsigned int size)
     // Choose which GPU to run on, change this on a multi-GPU system.
     cudaStatus = cudaSetDevice(0);
     if (cudaStatus != cudaSuccess) {
-        fprintf(stderr, "cudaSetDevice failed!  Do you have a CUDA-capable GPU installed?");
+        fprintf(stderr, "cudaSetDevice failed!  Do you have arg_pVector CUDA-capable GPU installed?");
         goto Error;
     }
 
@@ -579,31 +623,34 @@ Error:
     return cudaStatus;
 }
 
-cudaError_t CudaAccumulate(uint32_t* arg_pAccumulate, const uint32_t* arg_pVector, unsigned int arg_dSize)
+cudaError_t CudaAccumulate(uint32_t* arg_pAccumulate, const uint32_t* arg_pVector, unsigned int arg_dSize, const unsigned int arg_dSliceSize)
 {
+    assert(arg_dSliceSize <= 1024);
+
     cudaError_t cudaStatus = cudaError::cudaSuccess;
 
     uint32_t* dev_pVector = nullptr;
-    uint32_t* dev_pAccumulate = nullptr;
+    uint32_t* dev_pAccumulateStage1 = nullptr;
+    uint32_t* dev_pAccumulateStage2 = nullptr;
 
     uint32_t dSliceSize = 32;
-    uint32_t dSliceCount = 0;
 
     if (!arg_pVector || !arg_pAccumulate || !arg_dSize) return cudaError::cudaErrorAssert;
 
-    if (arg_dSize > dSliceSize) {
-        for (; dSliceSize < 512; dSliceSize *= 2)
-            if (arg_dSize / dSliceSize == 0 && arg_dSize / (dSliceSize * 2) == 1)
-                break;
-    }
-
-    uint32_t dRemainder = arg_dSize % dSliceSize;
-    if (dRemainder == 0) {
-        dSliceCount = arg_dSize / dSliceSize;
+    if (arg_dSliceSize == 0) {
+        if (arg_dSize > dSliceSize) {
+            for (; dSliceSize < 512; dSliceSize *= 2)
+                if (arg_dSize / dSliceSize == 0 && arg_dSize / (dSliceSize * 2) == 1)
+                    break;
+        }
     }
     else {
-        dSliceCount = (arg_dSize / dSliceSize) + 1;
+        dSliceSize = arg_dSliceSize;
     }
+
+    uint32_t dSliceCount = (arg_dSize + arg_dSliceSize - 1) / arg_dSliceSize;
+
+    assert(dSliceCount <= 1024);
 
     uint32_t smemSize = dSliceSize * sizeof(uint32_t);
     uint32_t dBufferSize = dSliceCount * dSliceSize;
@@ -611,7 +658,7 @@ cudaError_t CudaAccumulate(uint32_t* arg_pAccumulate, const uint32_t* arg_pVecto
     // Choose which GPU to run on, change this on a multi-GPU system.
     cudaStatus = cudaSetDevice(0);
     if (cudaStatus != cudaSuccess) {
-        fprintf(stderr, "cudaSetDevice failed!  Do you have a CUDA-capable GPU installed?");
+        fprintf(stderr, "cudaSetDevice failed!  Do you have arg_pVector CUDA-capable GPU installed?");
         goto Error;
     }
 
@@ -622,7 +669,13 @@ cudaError_t CudaAccumulate(uint32_t* arg_pAccumulate, const uint32_t* arg_pVecto
         goto Error;
     }
 
-    cudaStatus = cudaMalloc((void**)&dev_pAccumulate, dBufferSize * sizeof(uint32_t));
+    cudaStatus = cudaMalloc((void**)&dev_pAccumulateStage1, dBufferSize * sizeof(uint32_t));
+    if (cudaStatus != cudaSuccess) {
+        fprintf(stderr, "cudaMalloc failed!");
+        goto Error;
+    }
+
+    cudaStatus = cudaMalloc((void**)&dev_pAccumulateStage2, sizeof(uint32_t));
     if (cudaStatus != cudaSuccess) {
         fprintf(stderr, "cudaMalloc failed!");
         goto Error;
@@ -642,33 +695,21 @@ cudaError_t CudaAccumulate(uint32_t* arg_pAccumulate, const uint32_t* arg_pVecto
     }
 
     // Copy input vectors from host memory to GPU buffers.
-    cudaStatus = cudaMemset(dev_pAccumulate, 0, dBufferSize * sizeof(uint32_t));
+    cudaStatus = cudaMemset(dev_pAccumulateStage1, 0, dBufferSize * sizeof(uint32_t));
     if (cudaStatus != cudaSuccess) {
         fprintf(stderr, "cudaMemcpy failed!");
         goto Error;
     }
 
-    for (uint32_t iter_slice = 0; iter_slice < dSliceCount; iter_slice++) {
-        cg_reduce<uint32_t> <<<1, dSliceSize, smemSize>>> (dev_pVector + (iter_slice * dSliceSize), dev_pAccumulate + (iter_slice * dSliceSize), dSliceSize);
-
-        // Check for any errors launching the kernel
-        cudaStatus = cudaGetLastError();
-        if (cudaStatus != cudaSuccess) {
-            fprintf(stderr, "cg_reduce launch failed: %s in iteration %d\n", cudaGetErrorString(cudaStatus), iter_slice);
-            goto Error;
-        }
-
-        if (iter_slice != 0) {
-            vector_sum<uint32_t> <<<1, dSliceSize>>> (dev_pAccumulate + (iter_slice * dSliceSize), dev_pAccumulate, dSliceSize);
-
-            // Check for any errors launching the kernel
-            cudaStatus = cudaGetLastError();
-            if (cudaStatus != cudaSuccess) {
-                fprintf(stderr, "vector_sum launch failed: %s in iteration %d\n", cudaGetErrorString(cudaStatus), iter_slice);
-                goto Error;
-            }
-        }
+    // Copy input vectors from host memory to GPU buffers.
+    cudaStatus = cudaMemset(dev_pAccumulateStage2, 0, sizeof(uint32_t));
+    if (cudaStatus != cudaSuccess) {
+        fprintf(stderr, "cudaMemcpy failed!");
+        goto Error;
     }
+
+    reduce0<uint32_t> <<<dSliceCount, arg_dSliceSize, smemSize>>> (dev_pVector, dev_pAccumulateStage1, arg_dSize);
+    reduce0<uint32_t> <<<1, dSliceCount, smemSize >>> (dev_pAccumulateStage1, dev_pAccumulateStage2, dSliceCount);
 
     // cudaDeviceSynchronize waits for the kernel to finish, and returns
     // any errors encountered during the launch.
@@ -679,7 +720,7 @@ cudaError_t CudaAccumulate(uint32_t* arg_pAccumulate, const uint32_t* arg_pVecto
     }
 
     // Copy output vector from GPU buffer to host memory.
-    cudaStatus = cudaMemcpy(arg_pAccumulate, dev_pAccumulate, arg_dSize * sizeof(uint32_t), cudaMemcpyDeviceToHost);
+    cudaStatus = cudaMemcpy(arg_pAccumulate, dev_pAccumulateStage2, sizeof(uint32_t), cudaMemcpyDeviceToHost);
     if (cudaStatus != cudaSuccess) {
         fprintf(stderr, "cudaMemcpy failed!");
         goto Error;
@@ -687,28 +728,40 @@ cudaError_t CudaAccumulate(uint32_t* arg_pAccumulate, const uint32_t* arg_pVecto
 
 Error:
     cudaFree(dev_pVector);
-    cudaFree(dev_pAccumulate);
+    cudaFree(dev_pAccumulateStage1);
+    cudaFree(dev_pAccumulateStage2);
 
     return cudaStatus;
-
 }
 
-cudaError_t CudaSparseToDense(uint32_t* arg_pArrayToModify, uint32_t arg_dSize)
+cudaError_t CudaSparseToPackedCell(uint32_t* arg_pArrayToModify, uint32_t arg_dSize, const uint32_t arg_dSliceSize)
 {
+    assert(arg_dSliceSize <= 1024);
+
     uint32_t* dev_a = 0;
     cudaError_t cudaStatus;
+
+    uint32_t dSliceCount = (arg_dSize + arg_dSliceSize - 1) / arg_dSliceSize;
+    uint32_t dBufferSize = dSliceCount * arg_dSliceSize;
+
 
     // Choose which GPU to run on, change this on a multi-GPU system.
     cudaStatus = cudaSetDevice(0);
     if (cudaStatus != cudaSuccess) {
-        fprintf(stderr, "cudaSetDevice failed!  Do you have a CUDA-capable GPU installed?");
+        fprintf(stderr, "cudaSetDevice failed!  Do you have arg_pVector CUDA-capable GPU installed?");
         goto Error;
     }
 
     // Allocate GPU buffers for array
-    cudaStatus = cudaMalloc((void**)&dev_a, arg_dSize * sizeof(int));
+    cudaStatus = cudaMalloc((void**)&dev_a, dBufferSize * sizeof(int));
     if (cudaStatus != cudaSuccess) {
         fprintf(stderr, "cudaMalloc failed!");
+        goto Error;
+    }
+
+    cudaStatus = cudaMemset(dev_a, 0, dBufferSize * sizeof(uint32_t));
+    if (cudaStatus != cudaSuccess) {
+        fprintf(stderr, "cudaMemcpy failed!");
         goto Error;
     }
 
@@ -721,8 +774,8 @@ cudaError_t CudaSparseToDense(uint32_t* arg_pArrayToModify, uint32_t arg_dSize)
 
     // Launch a kernel on the GPU with one thread for each element.
     uint32_t smemSize = arg_dSize * sizeof(int);
-    masked_array_to_list<uint32_t> 
-        <<<1, 128, smemSize>>>
+    masked_array_to_list_first<uint32_t>
+        <<<dSliceCount, arg_dSliceSize, smemSize>>>
         (dev_a, 0u, arg_dSize);
 
     // Check for any errors launching the kernel
@@ -751,4 +804,182 @@ Error:
     cudaFree(dev_a);
 
     return cudaStatus;
+}
+
+cudaError_t CudaMergeCells(uint32_t* arg_pArrayToModify, uint32_t* arg_pCellLengthArray, uint32_t arg_dSize, const uint32_t arg_dCellSize, const uint32_t arg_dCellCount)
+{
+    cudaError_t cudaStatus = cudaError::cudaSuccess;
+
+    uint32_t* dev_pVector = nullptr;
+    uint32_t* dev_pLengthArray = nullptr;
+
+    uint32_t dBufferSize = arg_dCellCount * arg_dCellSize;
+
+    // Choose which GPU to run on, change this on a multi-GPU system.
+    cudaStatus = cudaSetDevice(0);
+    if (cudaStatus != cudaSuccess) {
+        fprintf(stderr, "cudaSetDevice failed!  Do you have arg_pVector CUDA-capable GPU installed?");
+        goto Error;
+    }
+
+    // Allocate GPU buffers for three vectors (two input, one output)    .
+    cudaStatus = cudaMalloc((void**)&dev_pVector, dBufferSize * sizeof(uint32_t));
+    if (cudaStatus != cudaSuccess) {
+        fprintf(stderr, "cudaMalloc failed!");
+        goto Error;
+    }
+
+    cudaStatus = cudaMalloc((void**)&dev_pLengthArray, arg_dCellCount * sizeof(uint32_t));
+    if (cudaStatus != cudaSuccess) {
+        fprintf(stderr, "cudaMalloc failed!");
+        goto Error;
+    }
+
+    cudaStatus = cudaMemset(dev_pVector, 0, dBufferSize * sizeof(uint32_t));
+    if (cudaStatus != cudaSuccess) {
+        fprintf(stderr, "cudaMemcpy failed!");
+        goto Error;
+    }
+
+    // Copy input vectors from host memory to GPU buffers.
+    cudaStatus = cudaMemcpy(dev_pVector, arg_pArrayToModify, arg_dSize * sizeof(uint32_t), cudaMemcpyHostToDevice);
+    if (cudaStatus != cudaSuccess) {
+        fprintf(stderr, "cudaMemcpy failed!");
+        goto Error;
+    }
+
+    cudaStatus = cudaMemcpy(dev_pLengthArray, arg_pCellLengthArray, arg_dCellCount * sizeof(uint32_t), cudaMemcpyHostToDevice);
+    if (cudaStatus != cudaSuccess) {
+        fprintf(stderr, "cudaMemcpy failed!");
+        goto Error;
+    }
+
+    masked_array_to_list_second<uint32_t> <<<1, arg_dCellCount>>> (dev_pVector, dev_pLengthArray, dBufferSize, arg_dCellCount, arg_dCellSize);
+
+    // cudaDeviceSynchronize waits for the kernel to finish, and returns
+    // any errors encountered during the launch.
+    cudaStatus = cudaDeviceSynchronize();
+    if (cudaStatus != cudaSuccess) {
+        fprintf(stderr, "cudaDeviceSynchronize returned error code %d after launching addKernel!\n", cudaStatus);
+        goto Error;
+    }
+
+    // Copy output vector from GPU buffer to host memory.
+    cudaStatus = cudaMemcpy(arg_pArrayToModify, dev_pVector, arg_dSize * sizeof(uint32_t), cudaMemcpyDeviceToHost);
+    if (cudaStatus != cudaSuccess) {
+        fprintf(stderr, "cudaMemcpy failed!");
+        goto Error;
+    }
+
+Error:
+    cudaFree(dev_pVector);
+    cudaFree(dev_pLengthArray);
+
+    return cudaStatus;
+}
+
+cudaError_t CudaAccumulateAndPack(uint32_t* arg_pArray, const uint32_t arg_dSize)
+{
+    //The current code of this function only support 2^19 long arrays
+    assert(arg_dSize > (1 << 19));
+    cudaError_t cudaStatus = cudaError::cudaSuccess;
+
+    uint32_t* dev_pVector = nullptr;
+    uint32_t* dev_pBinSumsForFinalPacking = nullptr;
+    uint32_t* dev_pFinalReduceResult = nullptr;
+    uint32_t* dev_pFirstReduceResult = nullptr;
+
+    uint32_t dSliceSize = 32;
+    uint32_t dSliceCount = 0;
+
+    if (!arg_pArray || !arg_dSize) return cudaError::cudaErrorAssert;
+
+    if (arg_dSize > dSliceSize) {
+        for (; dSliceSize < 512; dSliceSize *= 2)
+            if (arg_dSize / dSliceSize == 0 && arg_dSize / (dSliceSize * 2) == 1)
+                break;
+    }
+
+    uint32_t dRemainder = arg_dSize % dSliceSize;
+    if (dRemainder == 0) {
+        dSliceCount = arg_dSize / dSliceSize;
+    }
+    else {
+        dSliceCount = (arg_dSize / dSliceSize) + 1;
+    }
+
+    uint32_t smemSize = dSliceSize * sizeof(uint32_t);
+    //uint32_t smemSize = ((dSliceSize / 32) + 1) * sizeof(uint32_t);
+    uint32_t dBufferSize = dSliceCount * dSliceSize;
+
+    uint32_t dCollectStageGridSize = 1;// arg_dSize / (1024 * dSliceSize);
+
+    // Choose which GPU to run on, change this on a multi-GPU system.
+    cudaStatus = cudaSetDevice(0);
+    if (cudaStatus != cudaSuccess) {
+        fprintf(stderr, "cudaSetDevice failed!  Do you have arg_pVector CUDA-capable GPU installed?");
+        goto Error;
+    }
+
+    // Allocate GPU buffers for three vectors (two input, one output)    .
+    cudaStatus = cudaMalloc((void**)&dev_pVector, dBufferSize * sizeof(uint32_t));
+    if (cudaStatus != cudaSuccess) {
+        fprintf(stderr, "cudaMalloc failed!");
+        goto Error;
+    }
+
+    cudaStatus = cudaMalloc((void**)&dev_pFirstReduceResult, dBufferSize * sizeof(uint32_t));
+    if (cudaStatus != cudaSuccess) {
+        fprintf(stderr, "cudaMalloc failed!");
+        goto Error;
+    }
+
+    cudaStatus = cudaMalloc((void**)&dev_pFinalReduceResult, dSliceCount * sizeof(uint32_t));
+    if (cudaStatus != cudaSuccess) {
+        fprintf(stderr, "cudaMalloc failed!");
+        goto Error;
+    }
+
+    cudaStatus = cudaMalloc((void**)&dev_pBinSumsForFinalPacking, dSliceCount * sizeof(uint32_t));
+    if (cudaStatus != cudaSuccess) {
+        fprintf(stderr, "cudaMalloc failed!");
+        goto Error;
+    }
+
+    cudaStatus = cudaMemset(dev_pVector, 0, dBufferSize * sizeof(uint32_t));
+    if (cudaStatus != cudaSuccess) {
+        fprintf(stderr, "cudaMemcpy failed!");
+        goto Error;
+    }
+
+    // Copy input vectors from host memory to GPU buffers.
+    cudaStatus = cudaMemcpy(dev_pVector, arg_pArray, arg_dSize * sizeof(uint32_t), cudaMemcpyHostToDevice);
+    if (cudaStatus != cudaSuccess) {
+        fprintf(stderr, "cudaMemcpy failed!");
+        goto Error;
+    }
+
+    // Copy input vectors from host memory to GPU buffers.
+    cudaStatus = cudaMemset(dev_pFirstReduceResult, 0, dBufferSize * sizeof(uint32_t));
+    if (cudaStatus != cudaSuccess) {
+        fprintf(stderr, "cudaMemcpy failed!");
+        goto Error;
+    }
+
+    cg_reduce<uint32_t> <<<dSliceCount, dSliceSize, smemSize>>> (dev_pVector, dev_pFirstReduceResult, dBufferSize);
+    uint32_t smemSizeForSecondStage = dSliceCount * sizeof(uint32_t);
+    cg_reduce<uint32_t> <<<1, dSliceCount, smemSizeForSecondStage>>> (dev_pFirstReduceResult, dev_pFinalReduceResult, dSliceCount);
+    uint32_t smemSizeForFirstStage = dSliceSize * sizeof(uint32_t);
+    masked_array_to_list_first<uint32_t> <<<dSliceCount, dSliceSize, smemSizeForFirstStage >>> (dev_pVector, 0, dBufferSize);
+    smemSizeForSecondStage = dSliceCount * sizeof(uint32_t);
+    masked_array_to_list_second<uint32_t> <<<1, dSliceCount, smemSizeForSecondStage>>>(dev_pVector, dev_pFirstReduceResult, dBufferSize, dSliceCount, dSliceSize);
+
+Error:
+    cudaFree(dev_pVector);
+    cudaFree(dev_pBinSumsForFinalPacking);
+    cudaFree(dev_pFirstReduceResult);
+    cudaFree(dev_pFinalReduceResult);
+
+    return cudaStatus;
+
 }
