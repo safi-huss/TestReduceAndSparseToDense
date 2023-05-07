@@ -362,6 +362,19 @@ __global__ void collect_reduce_first_elem(Type* arg_result, Type* arg_array, uin
     }
 }
 
+template <class Type>
+__global__ void swap(Type* arg_dest, Type* arg_src, const uint32_t arg_size)
+{
+    uint32_t kernelThreadId = blockIdx.x * blockDim.x + threadIdx.x;
+    uint32_t kernelStride = blockDim.x * gridDim.x;
+
+    for (uint32_t idx_stride = 0; idx_stride < arg_size; idx_stride += kernelStride) {
+        Type temp = arg_dest[idx_stride];
+        arg_dest[idx_stride] = arg_src[idx_stride];
+        arg_src[idx_stride] = temp;
+    }
+}
+
 typedef void (*SimpleFunc)(int* c, int* a);
 
 int main()
@@ -419,7 +432,7 @@ int main()
     printf("\n\n");
 
     // Add vectors in parallel.
-    cudaError_t cudaStatus = CudaReduce(sum_array, sparse_array, array_size, 64);
+    cudaError_t cudaStatus = CudaReduce(sum_array, sparse_array, array_size, slice_size);
     if (cudaStatus != cudaSuccess) {
         fprintf(stderr, "CudaReduce failed!");
         return 1;
@@ -433,7 +446,7 @@ int main()
     printf("\n\n");
 
     // Add vectors in parallel.
-    cudaStatus = CudaAccumulate(&sum, sparse_array, array_size, 64);
+    cudaStatus = CudaAccumulate(&sum, sparse_array, array_size, slice_size);
     if (cudaStatus != cudaSuccess) {
         fprintf(stderr, "CudaAccumulate failed!");
         return 1;
@@ -441,13 +454,13 @@ int main()
 
     printf("Cuda Total Sum: %d\n\n", sum);
 
-    cudaStatus = CudaSparseToPackedCell(sparse_array, array_size, 64);
+    cudaStatus = CudaSparseToPackedCell(sparse_array, array_size, slice_size);
     if (cudaStatus != cudaSuccess) {
         fprintf(stderr, "CudaSparseToPackedCell failed!");
         return 1;
     }
 
-    printf("Cuda Packed Elems:\n");
+    printf("Cuda Packed Cell Elems:\n");
     for (uint32_t slice_idx = 0; slice_idx < array_size; slice_idx += slice_size) {
         uint32_t slice_sum = 0;
         uint32_t slice_packed_len = sum_array[slice_idx / slice_size];
@@ -459,6 +472,25 @@ int main()
         printf("%d, ", slice_sum);
     }
     printf("\n\n");
+
+    cudaStatus = CudaMergeCells(sparse_array, sum_array, array_size, slice_size, array_size / slice_size);
+
+    uint32_t packed_count_cuda = 0;
+    for (uint32_t array_idx = 0; array_idx < sum; array_idx++) {
+        packed_count_cuda += sparse_array[array_idx];
+    }
+    printf("Cuda Fully Packed Array: %d\n\n", packed_count_cuda);
+
+    printf("Cuda Final Array:\n");
+    for (uint32_t slice_idx = 0; slice_idx < array_size; slice_idx += slice_size) {
+        for (uint32_t inner_idx = 0; inner_idx < slice_size; inner_idx++) {
+            printf("%d, ", sparse_array[slice_idx + inner_idx]);
+        }
+
+        printf("\n");
+    }
+    printf("\n\n");
+
 
     // cudaDeviceReset must be called before exiting in order for profiling and
     // tracing tools such as Nsight and Visual Profiler to show complete traces.
