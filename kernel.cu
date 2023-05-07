@@ -7,6 +7,8 @@
 
 namespace cg = cooperative_groups;
 
+#include <iostream>
+#include <fstream>
 #include <stdio.h>
 #include <cstdint>
 #include <cmath>
@@ -319,7 +321,7 @@ __global__ void masked_array_to_list_first(Type* arg_array, Type arg_data_zero, 
 
 /* arg_length_array_size == blockDom.x // the number of length elements passed should be equal to the number of threads */
 template <class Type>
-__global__ void masked_array_to_list_second(Type* arg_array, Type* arg_length_array, uint32_t arg_array_size, uint32_t arg_length_array_size, uint32_t arg_cell_size)
+__global__ void masked_array_to_list_second(Type* arg_array, Type* arg_length_array, const uint32_t arg_array_size, const uint32_t arg_length_array_size, const uint32_t arg_cell_size)
 {
     uint32_t kernelThreadId = blockIdx.x * blockDim.x + threadIdx.x;
     uint32_t kernelStride = blockDim.x * gridDim.x;
@@ -327,10 +329,10 @@ __global__ void masked_array_to_list_second(Type* arg_array, Type* arg_length_ar
     uint32_t threadId = threadIdx.x;
     uint32_t threadCount = blockDim.x;
 
-    for (uint32_t loop_stride = 2, loop_cell_size = arg_cell_size; loop_stride <= arg_length_array_size; loop_stride <<= 1, loop_cell_size <<= 1) {
+    for (uint32_t loop_stride = 2; loop_stride <= arg_length_array_size; loop_stride <<= 1) {
         if (threadId % loop_stride == 0) {
             uint32_t left_length = arg_length_array[threadId], right_length = arg_length_array[threadId + loop_stride - (loop_stride >> 1)];
-            uint32_t left_start = loop_cell_size * threadId, right_start = loop_cell_size * threadId + loop_cell_size;
+            uint32_t left_start = arg_cell_size * threadId, right_start = arg_cell_size * threadId + (arg_cell_size * (loop_stride >> 1));
             uint32_t transfered_elems = 0;
 
             while (transfered_elems < right_length) {
@@ -346,6 +348,8 @@ __global__ void masked_array_to_list_second(Type* arg_array, Type* arg_length_ar
 
         __syncthreads();
     }
+
+    __syncthreads();
 }
 
 template <class Type>
@@ -473,6 +477,18 @@ int main()
     }
     printf("\n\n");
 
+    printf("Cuda Array Pre-merge:\n");
+    for (uint32_t slice_idx = 0; slice_idx < array_size; slice_idx += slice_size) {
+        printf("%3d: ", sum_array[slice_idx / slice_size]);
+
+        for (uint32_t inner_idx = 0; inner_idx < slice_size; inner_idx++) {
+            printf("%d, ", sparse_array[slice_idx + inner_idx]);
+        }
+
+        printf("\n");
+    }
+    printf("\n\n");
+
     cudaStatus = CudaMergeCells(sparse_array, sum_array, array_size, slice_size, array_size / slice_size);
 
     uint32_t packed_count_cuda = 0;
@@ -483,6 +499,8 @@ int main()
 
     printf("Cuda Final Array:\n");
     for (uint32_t slice_idx = 0; slice_idx < array_size; slice_idx += slice_size) {
+        printf("%3d: ", sum_array[slice_idx / slice_size]);
+
         for (uint32_t inner_idx = 0; inner_idx < slice_size; inner_idx++) {
             printf("%d, ", sparse_array[slice_idx + inner_idx]);
         }
@@ -898,6 +916,13 @@ cudaError_t CudaMergeCells(uint32_t* arg_pArrayToModify, uint32_t* arg_pCellLeng
 
     // Copy output vector from GPU buffer to host memory.
     cudaStatus = cudaMemcpy(arg_pArrayToModify, dev_pVector, arg_dSize * sizeof(uint32_t), cudaMemcpyDeviceToHost);
+    if (cudaStatus != cudaSuccess) {
+        fprintf(stderr, "cudaMemcpy failed!");
+        goto Error;
+    }
+
+    // Copy output vector from GPU buffer to host memory.
+    cudaStatus = cudaMemcpy(arg_pCellLengthArray, dev_pLengthArray, arg_dCellSize * sizeof(uint32_t), cudaMemcpyDeviceToHost);
     if (cudaStatus != cudaSuccess) {
         fprintf(stderr, "cudaMemcpy failed!");
         goto Error;
