@@ -388,6 +388,7 @@ int main()
     const unsigned int count = 600;
 
     unsigned int sparse_array[array_size] = {};
+    unsigned int sparse_array_copy[array_size] = {};
     
     unsigned int sum_array[array_size] = {};
 
@@ -408,6 +409,8 @@ int main()
 
         sparse_array[idx_sparse_elem] = 1;
     }
+
+     memcpy(sparse_array_copy, sparse_array, array_size * sizeof(unsigned int));
 
     //Check
     uint32_t sum_check = 0;
@@ -477,18 +480,6 @@ int main()
     }
     printf("\n\n");
 
-    printf("Cuda Array Pre-merge:\n");
-    for (uint32_t slice_idx = 0; slice_idx < array_size; slice_idx += slice_size) {
-        printf("%3d: ", sum_array[slice_idx / slice_size]);
-
-        for (uint32_t inner_idx = 0; inner_idx < slice_size; inner_idx++) {
-            printf("%d, ", sparse_array[slice_idx + inner_idx]);
-        }
-
-        printf("\n");
-    }
-    printf("\n\n");
-
     cudaStatus = CudaMergeCells(sparse_array, sum_array, array_size, slice_size, array_size / slice_size);
 
     uint32_t packed_count_cuda = 0;
@@ -497,18 +488,27 @@ int main()
     }
     printf("Cuda Fully Packed Array: %d\n\n", packed_count_cuda);
 
-    printf("Cuda Final Array:\n");
+    printf("Cuda Array Pre-merge:\n");
     for (uint32_t slice_idx = 0; slice_idx < array_size; slice_idx += slice_size) {
-        printf("%3d: ", sum_array[slice_idx / slice_size]);
-
         for (uint32_t inner_idx = 0; inner_idx < slice_size; inner_idx++) {
-            printf("%d, ", sparse_array[slice_idx + inner_idx]);
+            printf("%d, ", sparse_array_copy[slice_idx + inner_idx]);
         }
 
         printf("\n");
     }
     printf("\n\n");
 
+    cudaStatus = CudaAccumulateAndPack(sparse_array_copy, array_size);
+
+    printf("Cuda Final Array:\n");
+    for (uint32_t slice_idx = 0; slice_idx < array_size; slice_idx += slice_size) {
+        for (uint32_t inner_idx = 0; inner_idx < slice_size; inner_idx++) {
+            printf("%d, ", sparse_array_copy[slice_idx + inner_idx]);
+        }
+
+        printf("\n");
+    }
+    printf("\n\n");
 
     // cudaDeviceReset must be called before exiting in order for profiling and
     // tracing tools such as Nsight and Visual Profiler to show complete traces.
@@ -938,7 +938,7 @@ Error:
 cudaError_t CudaAccumulateAndPack(uint32_t* arg_pArray, const uint32_t arg_dSize)
 {
     //The current code of this function only support 2^19 long arrays
-    assert(arg_dSize > (1 << 19));
+    assert(arg_dSize < (1 << 19));
     cudaError_t cudaStatus = cudaError::cudaSuccess;
 
     uint32_t* dev_pVector = nullptr;
@@ -1030,6 +1030,20 @@ cudaError_t CudaAccumulateAndPack(uint32_t* arg_pArray, const uint32_t arg_dSize
     masked_array_to_list_first<uint32_t> <<<dSliceCount, dSliceSize, smemSizeForFirstStage >>> (dev_pVector, 0, dBufferSize);
     smemSizeForSecondStage = dSliceCount * sizeof(uint32_t);
     masked_array_to_list_second<uint32_t> <<<1, dSliceCount, smemSizeForSecondStage>>>(dev_pVector, dev_pFirstReduceResult, dBufferSize, dSliceCount, dSliceSize);
+
+    cudaStatus = cudaDeviceSynchronize();
+    if (cudaStatus != cudaSuccess) {
+        fprintf(stderr, "cudaDeviceSynchronize returned error code %d after launching addKernel!\n", cudaStatus);
+        goto Error;
+    }
+
+    // Copy output vector from GPU buffer to host memory.
+    cudaStatus = cudaMemcpy(arg_pArray, dev_pVector, arg_dSize * sizeof(uint32_t), cudaMemcpyDeviceToHost);
+    if (cudaStatus != cudaSuccess) {
+        fprintf(stderr, "cudaMemcpy failed!");
+        goto Error;
+    }
+
 
 Error:
     cudaFree(dev_pVector);
