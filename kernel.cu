@@ -957,13 +957,7 @@ cudaError_t CudaAccumulateAndPack(uint32_t* arg_pArray, const uint32_t arg_dSize
                 break;
     }
 
-    uint32_t dRemainder = arg_dSize % dSliceSize;
-    if (dRemainder == 0) {
-        dSliceCount = arg_dSize / dSliceSize;
-    }
-    else {
-        dSliceCount = (arg_dSize / dSliceSize) + 1;
-    }
+    dSliceCount = (arg_dSize + dSliceSize - 1) / dSliceSize;
 
     uint32_t smemSize = dSliceSize * sizeof(uint32_t);
     //uint32_t smemSize = ((dSliceSize / 32) + 1) * sizeof(uint32_t);
